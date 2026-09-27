@@ -1,0 +1,76 @@
+name: Hetzner CX33 Monitor
+
+# Free, near-continuous monitoring via GitHub Actions (no VPS, no card).
+#
+# Instead of an unreliable */5 cron (GitHub often delays or skips short
+# schedules), each run stays alive for ~5 hours and checks every 60 seconds.
+# A coarse schedule (every 2 hours) keeps a fresh run queued so that when one
+# run ends, the next takes over seamlessly — giving ~60s detection latency,
+# 24/7, for free on a public repository.
+
+on:
+  # Manual trigger (use once to start the very first run immediately).
+  workflow_dispatch:
+  schedule:
+    # Every 2 hours. Runs last ~5h, so there is always a queued run ready to
+    # take over the moment the current one finishes (concurrency serializes
+    # them, so only one runs at a time).
+    - cron: "0 */2 * * *"
+
+# Keep exactly one monitor running. A newly scheduled run waits (pending)
+# until the current ~5h run finishes, then takes over — no gaps, no overlap.
+concurrency:
+  group: hetzner-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    # Safety cap below GitHub's 6h hard limit. The app also self-exits at
+    # MAX_RUNTIME_SECONDS (5h) so runs finish cleanly (green), not cancelled.
+    timeout-minutes: 330
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Restore previous state
+        uses: actions/cache/restore@v5
+        with:
+          path: .state
+          key: hetzner-state-${{ github.run_id }}
+          restore-keys: |
+            hetzner-state-
+
+      - name: Run monitor (checks every 60s for ~5h)
+        env:
+          API_TOKEN: ${{ secrets.API_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Read from repository Variables first, then Secrets, then default.
+          SERVER_TYPES: ${{ vars.SERVER_TYPES || secrets.SERVER_TYPES || 'cx33' }}
+          LOCATIONS: ${{ vars.LOCATIONS || secrets.LOCATIONS || 'fsn1,nbg1,hel1' }}
+          CHECK_INTERVAL_SECONDS: "60"
+          MAX_RUNTIME_SECONDS: "18000"
+          STATE_FILE: ".state/state.json"
+        run: node dist/index.js
+
+      - name: Save state
+        # Persist "already notified" state so Telegram fires only once per
+        # availability episode, even across the run handoffs above.
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: .state
+          key: hetzner-state-${{ github.run_id }}
