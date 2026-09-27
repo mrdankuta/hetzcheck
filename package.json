@@ -1,0 +1,31 @@
+{
+  "name": "hetzner-check-tarif",
+  "version": "1.0.0",
+  "description": "Monitors availability of the Hetzner Cloud CX33 (Cost Optimized) server type across multiple locations and notifies via console and Telegram.",
+  "main": "dist/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "ts-node src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "hetzner",
+    "hetzner-cloud",
+    "cx33",
+    "availability",
+    "monitor",
+    "telegram"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.4",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.2"
+  }
+}
