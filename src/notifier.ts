@@ -46,6 +46,37 @@ export class Notifier {
     await this.sendMessage(message);
   }
 
+  /**
+   * Notifies that a server was auto-provisioned. Safe to call when
+   * Telegram is disabled (no-op).
+   */
+  async notifyProvisioned(
+    serverType: string,
+    location: string,
+    serverName: string,
+    ipv4: string | null,
+    when: string,
+    specLines: string[] = [],
+  ): Promise<void> {
+    if (!this.config.enabled) {
+      return;
+    }
+
+    const specsBlock =
+      specLines.length > 0 ? `\n${specLines.join('\n')}\n` : '';
+    const ipBlock = ipv4 ? `\nIP: ${ipv4}\n` : '';
+
+    const message =
+      `✅ Hetzner ${serverType.toUpperCase()} PROVISIONED!\n\n` +
+      `Server: ${serverName}\n` +
+      `Location: ${location}\n` +
+      ipBlock +
+      specsBlock +
+      `\nTime: ${when}`;
+
+    await this.sendMessage(message);
+  }
+
   private async sendMessage(text: string): Promise<void> {
     const url = `https://api.telegram.org/bot${this.config.botToken}/sendMessage`;
 

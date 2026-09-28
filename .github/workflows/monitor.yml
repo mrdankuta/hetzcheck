@@ -64,11 +64,19 @@ jobs:
           CHECK_INTERVAL_SECONDS: "60"
           MAX_RUNTIME_SECONDS: "18000"
           STATE_FILE: ".state/state.json"
+          # Auto-provisioning (optional). Enable by setting Variables/Secrets.
+          # Requires API_TOKEN with Read & Write permission.
+          PROVISION_ENABLED: ${{ vars.PROVISION_ENABLED || secrets.PROVISION_ENABLED || 'false' }}
+          PROVISION_IMAGE: ${{ vars.PROVISION_IMAGE || secrets.PROVISION_IMAGE || '' }}
+          PROVISION_SSH_KEYS: ${{ secrets.PROVISION_SSH_KEYS || '' }}
+          PROVISION_NAME_PREFIX: ${{ vars.PROVISION_NAME_PREFIX || secrets.PROVISION_NAME_PREFIX || 'hetzcheck-' }}
+          PROVISION_DRY_RUN: ${{ vars.PROVISION_DRY_RUN || 'false' }}
         run: node dist/index.js
 
       - name: Save state
-        # Persist "already notified" state so Telegram fires only once per
-        # availability episode, even across the run handoffs above.
+        # Persist "already notified" + "already provisioned" state so Telegram
+        # fires only once per availability episode and servers are created
+        # only once, even across the run handoffs above.
         if: always()
         uses: actions/cache/save@v5
         with:

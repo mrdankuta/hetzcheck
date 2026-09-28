@@ -26,6 +26,18 @@ export interface AppConfig {
     botToken: string;
     chatId: string;
   };
+  /** Auto-provisioning configuration. Disabled unless explicitly enabled. */
+  provision: {
+    enabled: boolean;
+    /** OS image name, e.g. "ubuntu-24.04". Required when enabled. */
+    image: string;
+    /** SSH key names (as stored in Hetzner Cloud). May be empty (not recommended). */
+    sshKeys: string[];
+    /** Prefix for auto-created server names. Final name: "<prefix><type>", e.g. "hetzcheck-cx33". */
+    namePrefix: string;
+    /** When true, log what would be created without calling POST /servers. */
+    dryRun: boolean;
+  };
 }
 
 function required(name: string): string {
@@ -103,6 +115,31 @@ export function loadConfig(): AppConfig {
   const chatId = optional('TELEGRAM_CHAT_ID', '');
   const telegramEnabled = botToken !== '' && chatId !== '';
 
+  const provisionEnabled =
+    optional('PROVISION_ENABLED', 'false').toLowerCase() === 'true';
+  const provisionImage = optional('PROVISION_IMAGE', '');
+  const provisionSshKeys = optional('PROVISION_SSH_KEYS', '')
+    .split(',')
+    .map((key) => key.trim())
+    .filter((key) => key.length > 0);
+  const provisionNamePrefix = optional('PROVISION_NAME_PREFIX', 'hetzcheck-');
+  const provisionDryRun =
+    optional('PROVISION_DRY_RUN', 'false').toLowerCase() === 'true';
+
+  if (provisionEnabled) {
+    if (provisionImage === '') {
+      throw new Error(
+        'PROVISION_ENABLED=true requires PROVISION_IMAGE to be set ' +
+          '(e.g. "ubuntu-24.04").',
+      );
+    }
+    if (provisionNamePrefix === '') {
+      throw new Error(
+        'PROVISION_ENABLED=true requires PROVISION_NAME_PREFIX to be non-empty.',
+      );
+    }
+  }
+
   return {
     apiToken,
     serverTypes,
@@ -115,6 +152,13 @@ export function loadConfig(): AppConfig {
       enabled: telegramEnabled,
       botToken,
       chatId,
+    },
+    provision: {
+      enabled: provisionEnabled,
+      image: provisionImage,
+      sshKeys: provisionSshKeys,
+      namePrefix: provisionNamePrefix,
+      dryRun: provisionDryRun,
     },
   };
 }

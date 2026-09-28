@@ -201,7 +201,7 @@ All configuration lives in `.env` (see `.env.example`):
 
 | Variable                 | Required | Default            | Description                                                        |
 | ------------------------ | -------- | ------------------ | ------------------------------------------------------------------ |
-| `API_TOKEN`              | yes      | —                  | Hetzner Cloud API token (Read permission is enough).               |
+| `API_TOKEN`              | yes      | —                  | Hetzner Cloud API token (Read is enough for monitoring; Read & Write required for auto-provisioning). |
 | `TELEGRAM_BOT_TOKEN`     | no       | —                  | Telegram bot token. Enables Telegram when set.                     |
 | `TELEGRAM_CHAT_ID`       | no       | —                  | Telegram chat id. Enables Telegram when set.                       |
 | `SERVER_TYPES`           | no       | `cx33`             | Comma-separated Hetzner server type names, e.g. `cx33,cx23,cpx31`. |
@@ -209,11 +209,45 @@ All configuration lives in `.env` (see `.env.example`):
 | `CHECK_INTERVAL_SECONDS` | no       | `60`               | Seconds between checks (ignored when `RUN_ONCE=true`).            |
 | `RUN_ONCE`               | no       | `false`            | Run one check and exit (one-shot / cron style).                 |
 | `MAX_RUNTIME_SECONDS`    | no       | `0`                | Loop mode: exit cleanly after N seconds (`0` = forever).        |
-| `STATE_FILE`             | no       | —                  | Path to persist "notified" state across runs / handoffs.        |
+| `STATE_FILE`             | no       | —                  | Path to persist "notified" + "provisioned" state across runs / handoffs. |
+| `PROVISION_ENABLED`      | no       | `false`            | When `true`, create one server per type on first availability. Billing starts immediately. |
+| `PROVISION_IMAGE`        | when provisioning | —       | OS image, e.g. `ubuntu-24.04`. Required when `PROVISION_ENABLED=true`. |
+| `PROVISION_SSH_KEYS`     | no       | —                  | Comma-separated SSH key names already uploaded to Hetzner Cloud.   |
+| `PROVISION_NAME_PREFIX`  | no       | `hetzcheck-`       | Server name = `<prefix><type>`, e.g. `hetzcheck-cx33`. Doubles as idempotency key. |
+| `PROVISION_DRY_RUN`      | no       | `false`            | When `true`, log what would be created without calling `POST /servers`. |
 
 > Watching several server types adds **no extra API requests** — one
 > `/datacenters` call per cycle covers all of them. Each type is tracked
 > independently, so you get one Telegram message per type when it appears.
+
+## Auto-provisioning (optional)
+
+When `PROVISION_ENABLED=true`, the monitor creates **one server per watched
+type** the first time it becomes available, then keeps monitoring the
+remaining types:
+
+- **Target comes from `SERVER_TYPES`/`LOCATIONS`.** For each type, the first
+  available location in your `LOCATIONS` order wins (e.g. `fsn1` before
+  `nbg1`). Server name is `<PROVISION_NAME_PREFIX><type>`
+  (e.g. `hetzcheck-cx33`).
+- **Exactly once per type.** A `provisioned:<type>` flag in `STATE_FILE`
+  is authoritative — even if you later delete the server, nothing is
+  recreated unless you clear the state. A remote `GET /servers?name=`
+  check guards against duplicates when the state file is lost (e.g. Actions
+  cache miss). A duplicate-name race between check and create is also
+  treated as done, not retried.
+- **Failures retry.** If creation fails (sold out between check and create,
+  rate limit, network), the flag stays unset and the next 60s cycle retries.
+- **Token scope.** Monitoring works with a Read-only token; provisioning
+  needs **Read & Write**. Auth failures are logged with this hint.
+- **Test safely first:** set `PROVISION_DRY_RUN=true` to log
+  `[DRY RUN] Would provision ...` lines without creating anything, and
+  confirm the target type/location/name look right.
+
+GitHub Actions wiring: set `PROVISION_ENABLED`, `PROVISION_IMAGE`,
+`PROVISION_NAME_PREFIX` as Variables and `PROVISION_SSH_KEYS` as a Secret
+(see `.github/workflows/monitor.yml`). Your `API_TOKEN` secret must be the
+Read & Write token.
 
 ## Example output
 

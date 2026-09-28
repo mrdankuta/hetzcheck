@@ -38,6 +38,36 @@ function buildSpecLines(
 type AvailabilityState = Map<string, boolean>;
 
 /**
+ * State keys for "already provisioned" flags. Stored in the same map/file
+ * as availability so a single STATE_FILE covers both. Availability keys are
+ * bare type names ("cx33"); provisioned keys are namespaced and can never
+ * collide with a real server type.
+ */
+function provisionedKey(serverType: string): string {
+  return `provisioned:${serverType.toLowerCase()}`;
+}
+
+function isProvisioned(state: AvailabilityState, serverType: string): boolean {
+  return state.get(provisionedKey(serverType)) === true;
+}
+
+function markProvisioned(state: AvailabilityState, serverType: string): void {
+  state.set(provisionedKey(serverType), true);
+}
+
+/**
+ * Builds the deterministic server name for a type: "<prefix><type>".
+ * Sanitized to Hetzner-safe hostname characters so the same input always
+ * yields the same name — the name doubles as the idempotency key for the
+ * remote existence check.
+ */
+export function buildServerName(prefix: string, serverType: string): string {
+  const raw = `${prefix}${serverType}`.toLowerCase().replace(/[^a-z0-9.-]/g, '-');
+  const collapsed = raw.replace(/-+/g, '-').replace(/^[.-]+|[.-]+$/g, '');
+  return (collapsed === '' ? 'hetzcheck-server' : collapsed).slice(0, 63);
+}
+
+/**
  * Loads persisted availability state from disk. Used to keep the "notify once"
  * behavior working across separate process runs (e.g. GitHub Actions cron).
  * Missing/unreadable files simply yield an empty state.
@@ -84,10 +114,130 @@ function saveState(stateFile: string | null, state: AvailabilityState): void {
 }
 
 /**
+ * Attempts to provision a server for one type that is currently available.
+ * Runs at most once per type: the local `provisioned:<type>` flag is
+ * authoritative (strict "just once" — even if the server is later deleted,
+ * we never recreate unless the state file is cleared), while a remote
+ * `GET /servers?name=` check guards against duplicates when the state file
+ * was lost (e.g. Actions cache miss). Failures leave the flag unset so the
+ * next 60s cycle retries. Other server types are unaffected.
+ */
+async function maybeProvision(
+  config: AppConfig,
+  client: HetznerClient,
+  notifier: Notifier,
+  state: AvailabilityState,
+  serverType: string,
+  availableLocations: string[],
+  when: string,
+): Promise<void> {
+  if (!config.provision.enabled) {
+    return;
+  }
+  if (availableLocations.length === 0) {
+    return;
+  }
+  if (isProvisioned(state, serverType)) {
+    logger.info(
+      `${serverType.toUpperCase()} already provisioned earlier, skipping (still monitoring other types).`,
+    );
+    return;
+  }
+
+  // Target comes from SERVER_TYPES/LOCATIONS: first available location in
+  // the user's priority order.
+  const primaryLocation = availableLocations[0];
+  const serverName = buildServerName(config.provision.namePrefix, serverType);
+  const spec = client.getSpec(serverType);
+  const specLines = buildSpecLines(spec, primaryLocation);
+
+  if (config.provision.dryRun) {
+    logger.warn(
+      `[DRY RUN] Would provision ${serverType.toUpperCase()} in ${primaryLocation} ` +
+        `as "${serverName}" (image=${config.provision.image}, ` +
+        `ssh_keys=[${config.provision.sshKeys.join(', ') || 'none'}]). ` +
+        `No server created.`,
+    );
+    return;
+  }
+
+  if (config.provision.sshKeys.length === 0) {
+    logger.warn(
+      `PROVISION_SSH_KEYS is empty — creating "${serverName}" without an SSH key. ` +
+        `Make sure you can still access it (Hetzner console).`,
+    );
+  }
+
+  try {
+    logger.info(
+      `Provisioning ${serverType.toUpperCase()} in ${primaryLocation} as "${serverName}"...`,
+    );
+
+    const existing = await client.findServerByName(serverName);
+    if (existing) {
+      logger.warn(
+        `Server "${serverName}" already exists (id=${existing.id}). ` +
+          `Marking ${serverType.toUpperCase()} as provisioned without creating a duplicate.`,
+      );
+      markProvisioned(state, serverType);
+      return;
+    }
+
+    const created = await client.createServer({
+      name: serverName,
+      serverType: serverType.toLowerCase(),
+      image: config.provision.image,
+      location: primaryLocation.toLowerCase(),
+      sshKeys: config.provision.sshKeys,
+    });
+
+    logger.info(
+      `Provisioned ${serverType.toUpperCase()} as "${created.name}" ` +
+        `(id=${created.id}, ip=${created.ipv4 ?? 'pending'}) in ${primaryLocation}.`,
+    );
+    markProvisioned(state, serverType);
+    await notifier.notifyProvisioned(
+      serverType,
+      primaryLocation,
+      created.name,
+      created.ipv4,
+      when,
+      specLines,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    // Duplicate-name race between check and create: treat as done so we
+    // don't loop creating servers every cycle.
+    if (/uniqueness|already exists|already_taken|name.*taken/i.test(message)) {
+      logger.warn(
+        `Provisioning reported duplicate name for "${serverName}". ` +
+          `Marking as provisioned to avoid a retry loop: ${message}`,
+      );
+      markProvisioned(state, serverType);
+      return;
+    }
+    if (/401|403|permission|invalid.*token/i.test(message)) {
+      logger.error(
+        `Provisioning failed (auth/permission): ${message}. ` +
+          `Provisioning needs a Read & Write API token (monitoring alone works with Read-only).`,
+      );
+    } else {
+      logger.error(
+        `Provisioning failed for ${serverType.toUpperCase()} in ${primaryLocation}: ` +
+          `${message}. Will retry on the next check.`,
+      );
+    }
+    // Leave the provisioned flag unset so the next cycle retries.
+  }
+}
+
+/**
  * Runs a single availability check for all configured server types and reacts
  * to the results. The `state` map (server type -> wasAvailable) is mutated in
  * place so that each Telegram notification is sent only once per availability
- * "episode", independently per server type.
+ * "episode", independently per server type. Provisioning flags
+ * ("provisioned:<type>") live in the same map so they survive Actions
+ * handoffs via STATE_FILE.
  */
 async function runCheck(
   config: AppConfig,
@@ -149,6 +299,18 @@ async function runCheck(
         }
 
         state.set(key, true);
+
+        // Auto-provision (once per type, first available location in
+        // LOCATIONS order). Never blocks monitoring of other types.
+        await maybeProvision(
+          config,
+          client,
+          notifier,
+          state,
+          serverType,
+          availableLocations,
+          when,
+        );
       } else {
         logger.info(`${serverType.toUpperCase()} unavailable`);
         // Reset state so the next transition to "available" notifies again.
@@ -181,12 +343,19 @@ async function main(): Promise<void> {
   const notifier = new Notifier(config.telegram);
   const state = loadState(config.stateFile);
 
+  const provisionNote = config.provision.enabled
+    ? `Provisioning: enabled (image=${config.provision.image}, ` +
+      `prefix="${config.provision.namePrefix}"` +
+      `${config.provision.dryRun ? ', DRY RUN' : ''}).`
+    : 'Provisioning: disabled.';
+
   // Single-check mode: run once, persist state, and exit. Designed for
   // scheduled runners such as GitHub Actions cron.
   if (config.runOnce) {
     logger.info(
       `Running a single check. ` +
-        `Telegram: ${notifier.isEnabled ? 'enabled' : 'disabled'}.`,
+        `Telegram: ${notifier.isEnabled ? 'enabled' : 'disabled'}. ` +
+        provisionNote,
     );
     await runCheck(config, client, notifier, state);
     saveState(config.stateFile, state);
@@ -200,7 +369,8 @@ async function main(): Promise<void> {
   logger.info(
     `Started Hetzner availability monitor. ` +
       `Interval: ${config.checkIntervalMs / 1000}s.${maxRuntimeNote} ` +
-      `Telegram: ${notifier.isEnabled ? 'enabled' : 'disabled'}.`,
+      `Telegram: ${notifier.isEnabled ? 'enabled' : 'disabled'}. ` +
+      provisionNote,
   );
 
   const startedAt = Date.now();

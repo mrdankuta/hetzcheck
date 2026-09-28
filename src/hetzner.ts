@@ -75,6 +75,42 @@ interface DatacentersResponse {
 /** Maps each requested server type name to its available locations. */
 export type AvailabilityMap = Map<string, string[]>;
 
+/** Parameters for creating a server via POST /servers. */
+export interface CreateServerParams {
+  name: string;
+  serverType: string;
+  image: string;
+  location: string;
+  sshKeys: string[];
+}
+
+/** Minimal info about an existing or newly created server. */
+export interface ServerInfo {
+  id: number;
+  name: string;
+  ipv4: string | null;
+  ipv6: string | null;
+  status: string | null;
+}
+
+interface HetznerServer {
+  id: number;
+  name: string;
+  status?: string;
+  public_net?: {
+    ipv4?: { ip?: string };
+    ipv6?: { ip?: string };
+  };
+}
+
+interface ServersResponse {
+  servers: HetznerServer[];
+}
+
+interface CreateServerResponse {
+  server: HetznerServer;
+}
+
 export class HetznerClient {
   private readonly http: AxiosInstance;
   /** Cache of server type name (lowercase) -> full server type object. */
@@ -220,6 +256,62 @@ export class HetznerClient {
     } catch (error) {
       throw this.toApiError(error);
     }
+  }
+
+  /**
+   * Looks up a server by exact name. Returns null when no such server exists.
+   * Used as the remote idempotency guard before creating: the persisted
+   * state file (Actions cache) is best-effort and may be lost, but the
+   * Hetzner API is the source of truth for "did we already provision?".
+   */
+  async findServerByName(name: string): Promise<ServerInfo | null> {
+    try {
+      const { data } = await this.http.get<ServersResponse>('/servers', {
+        params: { name, per_page: 1 },
+      });
+      const match = data.servers.find((server) => server.name === name) ?? null;
+      return match ? this.toServerInfo(match) : null;
+    } catch (error) {
+      throw this.toApiError(error);
+    }
+  }
+
+  /**
+   * Creates a server via POST /servers. Resolves with the new server's
+   * id and public IPs. Throws HetznerApiError on failure — the caller
+   * decides whether to retry (e.g. sold out between check and create)
+   * or mark as done (e.g. name already exists).
+   */
+  async createServer(params: CreateServerParams): Promise<ServerInfo> {
+    try {
+      const { data } = await this.http.post<CreateServerResponse>(
+        '/servers',
+        {
+          name: params.name,
+          server_type: params.serverType,
+          image: params.image,
+          location: params.location,
+          ssh_keys: params.sshKeys,
+          start_after_create: true,
+          labels: {
+            'managed-by': 'hetzcheck',
+          },
+        },
+      );
+      return this.toServerInfo(data.server);
+    } catch (error) {
+      throw this.toApiError(error);
+    }
+  }
+
+  private toServerInfo(server: HetznerServer): ServerInfo {
+    return {
+      id: server.id,
+      name: server.name,
+      ipv4: server.public_net?.ipv4?.ip ?? null,
+      ipv6: server.public_net?.ipv6?.ip ?? null,
+      status: server.status ?? null,
+    };
   }
 
   /**
